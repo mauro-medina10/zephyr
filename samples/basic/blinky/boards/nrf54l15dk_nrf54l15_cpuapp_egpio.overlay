@@ -3,7 +3,52 @@
  *
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
+/ {
+	arduino_header: connector {
+		status = "disabled";
+	};
+};
 
-&led0 {
-	gpios = <&egpio 9 GPIO_ACTIVE_HIGH>;
+&pinctrl {
+	i2c1_nau7802: i2c1_nau7802 {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 31)>,
+				<NRF_PSEL(TWIM_SCL, 0, 30)>;
+			nordic,drive-mode = <NRF_DRIVE_S0D1>;	
+		};
+	};  
+    i2c1_sleep: i2c1_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 31)>,
+				<NRF_PSEL(TWIM_SCL, 0, 30)>;
+			low-power-enable;
+		};
+	};  
+};
+
+&i2c0 {
+    status = "disabled";
+};
+
+&i2c1 {
+    status = "okay";
+	compatible = "nordic,nrf-twim";
+    clock-frequency = <I2C_BITRATE_STANDARD>;
+    pinctrl-0 = <&i2c1_nau7802>;    // Active state (default)
+    pinctrl-1 = <&i2c1_sleep>;      // Sleep state (low-power)
+    pinctrl-names = "default", "sleep";
+	
+	nau7802: nau7802@2a {
+		status = "okay";
+		compatible = "nuvoton,nau7802-adc";
+		reg = <0x2a>;               // I2C address (0x2a is correct for 7-bit)
+		#io-channel-cells = <1>;    // Required for ADC channel selection
+		// vref-mv = <5000>;           // Ensure this matches your hardware's reference voltage
+		// channel-count = <2>;        // NAU7802 has 2 channels, so this is correct
+		//  // Add these required properties
+		//  channel = <0>;
+		//  ldo-voltage = <3>;  // Adjust based on your needs
+		//  gain = <128>;       // Adjust based on your needs
+		//  sps = <10>;        // Adjust based on your needs
+	};
 };

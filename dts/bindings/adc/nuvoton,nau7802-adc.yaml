@@ -1,0 +1,19 @@
+# Copyright (c) 2020 Nuvoton Technology Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+description: Nuvoton, NAU7802-ADC node
+
+compatible: "nuvoton,nau7802-adc"
+
+include: [adc-controller.yaml, i2c-device.yaml]
+
+properties:
+  "#io-channel-cells":
+    const: 1
+
+  alert-rdy-gpios:
+    type: phandle-array
+    description: Interrupt pin. Conversion ready
+
+io-channel-cells:
+  - input
