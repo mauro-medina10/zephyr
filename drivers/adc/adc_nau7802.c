@@ -5,11 +5,13 @@
  */
 
 #include <zephyr/device.h>
+#include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/util.h>
 
 LOG_MODULE_REGISTER(nau7802, CONFIG_ADC_LOG_LEVEL);
 
@@ -184,6 +186,22 @@ typedef enum
 	NAU7802_SPS_10  = 0x00,			// 0b000,
 } NAU7802_SPS_Values;
 
+enum {
+	/* ADS111X, ADS101X samples per second */
+	/* 10 samples per second */
+	NAU7802_CONFIG_DR_10 = 0,
+	/* 20 samples per second */
+	NAU7802_CONFIG_DR_20 = 1,
+	/* 40 samples per second (default) */
+	NAU7802_CONFIG_DR_40 = 2,
+	/* 80 samples per second */
+	NAU7802_CONFIG_DR_80 = 3,
+	/* 320 samples per second */
+	NAU7802_CONFIG_DR_320 = 4,
+	/* Default data rate */
+	NAU7802_CONFIG_DR_DEFAULT = NAU7802_CONFIG_DR_40
+};
+
 //Select between channel values
 typedef enum
 {
@@ -208,12 +226,11 @@ typedef enum
 struct nau7802_config 
 {
     // I2C device
-	struct i2c_dt_spec  i2c;
-	// Configuracion inicial
-	uint8_t             channel;
-	uint8_t             ldo_mode;
-	uint8_t             pga_gain;
-	uint8_t             sps_mode;
+	struct i2c_dt_spec  bus;
+	// LDO mode
+	NAU7802_LDO_Values ldo;
+	// Adq times
+	const uint32_t odr_delay[6];
 	Nau7802_chn_mode    chn_mode;	    // Single or Double channel
 	
 #ifdef ADC_NAU7802_TRIGGER
@@ -230,7 +247,7 @@ struct nau7802_data
 {
 	volatile uint8_t    irq_drdy_flg;   // Internal irq drdy flag
 	volatile int32_t    irq_data;	    // ADC data
-
+	k_timeout_t 		ready_time;
 	uint8_t             pwr_dwn_flg;    // Device power down flag
 	uint8_t             cal_status;	    // Calibration OK
 #ifdef ADC_NAU7802_TRIGGER
@@ -257,7 +274,7 @@ static int nau7802_powerUp(const struct device *dev);
 static int nau7802_setChannel(const struct device *dev, uint8_t channelNumber);
 static int nau7802_setSampleRate(const struct device *dev, NAU7802_SPS_Values rate);
 static int nau7802_waitForCalibrateAFE(const struct device *dev, uint32_t timeout_ms);
-static int nau7802_initial_config(const struct device *dev, Nau7802_chn_mode chn_mode);
+static int nau7802_initial_config(const struct device *dev, const struct adc_channel_cfg *channel_cfg);
 static int nau7802_start_conversions(const struct device *dev);
 static int nau7802_stop_conversions(const struct device *dev);
 static int nau7802_waitForCalibrateAFE(const struct device *dev, uint32_t timeout_ms);
@@ -272,6 +289,9 @@ int32_t nau7802_getReading(const struct device *dev);
 static int nau7802_check_chip_id(const struct device *dev);
 static int nau7802_beginCalibrateAFE(const struct device *dev);
 static int nau7802_calibrateAFE(const struct device *dev);
+static inline int nau7802_time_to_sps(const struct device *dev, uint16_t acq_time);
+static inline int nau7802_hidden_chn_config(const struct device *dev);
+
 //---------------------------------------------------------------------------------------//
 //  REGISTER IO
 //---------------------------------------------------------------------------------------//
@@ -290,7 +310,7 @@ static int nau7802_setRegister(const struct device *dev, uint8_t reg, uint8_t va
     int ret = 0;
     uint8_t tmp[2] = {reg, value};
 
-    ret = i2c_write_dt(&config->i2c, tmp, sizeof(tmp));
+    ret = i2c_write_dt(&config->bus, tmp, sizeof(tmp));
 
 	return ret;
 }
@@ -311,7 +331,7 @@ static int nau7802_getRegister(const struct device *dev, uint8_t reg, uint16_t *
 	
     if(!value) return -1;
 
-	ret = i2c_write_read_dt(&config->i2c, &reg, sizeof(reg), tmp, sizeof(tmp));
+	ret = i2c_write_read_dt(&config->bus, &reg, sizeof(reg), tmp, sizeof(tmp));
     if (ret) {
 		return ret;
 	}
@@ -336,7 +356,7 @@ static int nau7802_getSamples(const struct device *dev, uint8_t *value)
 	uint8_t reg = NAU7802_ADCO_B2;
     int ret = 0;
 
-    ret = i2c_write_read_dt(&config->i2c, (const void*)&reg, sizeof(reg), (void*)tmp, sizeof(tmp));
+    ret = i2c_write_read_dt(&config->bus, (const void*)&reg, sizeof(reg), (void*)tmp, sizeof(tmp));
 
 	if(ret)
     {	
@@ -435,40 +455,63 @@ static int nau7802_getBit(const struct device *dev, uint8_t bitNumber, uint8_t r
 int nau7802_init(const struct device *dev)
 {
 	const struct nau7802_config *config = dev->config;
-	const struct i2c_dt_spec *i2c = &config->i2c;
+	const struct i2c_dt_spec *bus = &config->bus;
     int ret = 0;
 
 	//Verify I2C
-	if (!i2c_is_ready_dt(i2c)) {
-		LOG_ERR("Bus not ready");
-		return -EINVAL;
+	if (!device_is_ready(config->bus.bus)) {
+		LOG_ERR("I2C bus %s not ready", config->bus.bus->name);
+		return -ENODEV;
 	}
+
 	// Power on analog and digital sections of the scale
 	ret = nau7802_powerUp(dev);
 	// CHIP-ID
 	ret |= nau7802_check_chip_id(dev);
 	if(ret)
 	{
-		return ret;
+		return -ENXIO;
 	}
+// 	// Initial config
+// 	ret |= nau7802_initial_config(dev, config->chn_mode);
+// 	// Re-cal analog front end when we change gain, sample rate, or channel
+// 	ret |= nau7802_calibrateAFE(dev);	
+// 	if(ret)
+// 	{
+// 		return ret;
+// 	}
+
+// #ifdef CONFIG_NAU7802_STABLE	
+// 	ret = nau7802_estabilization(dev);
+// #endif	
+	return ret;
+}
+
+static int nau7802_channel_setup(const struct device *dev,
+                                const struct adc_channel_cfg *channel_cfg) 
+{
+	const struct nau7802_config *ads_config = dev->config;
+	struct nau7802_data *data = dev->data;
+	int ret = 0;
+
+	if (channel_cfg->channel_id > 1) {
+		LOG_ERR("unsupported channel id '%d'", channel_cfg->channel_id);
+		return -ENOTSUP;
+	}
+
+	if (channel_cfg->reference != ADC_REF_EXTERNAL0) {
+		LOG_ERR("unsupported channel reference type '%d'", channel_cfg->reference);
+		return -ENOTSUP;
+	}
+
 	// Initial config
-	ret |= nau7802_initial_config(dev, config->chn_mode);
+	ret |= nau7802_initial_config(dev, channel_cfg);
 	// Re-cal analog front end when we change gain, sample rate, or channel
 	ret |= nau7802_calibrateAFE(dev);	
 	if(ret)
 	{
 		return ret;
 	}
-
-#ifdef CONFIG_NAU7802_STABLE	
-	ret = nau7802_estabilization(dev);
-#endif	
-	return ret;
-}
-
-static int nau7802_channel_setup(const struct device *dev,
-                                const struct adc_channel_cfg *channel_cfg) {
-    // Validate channel ID and gain here
     return 0;
 }
 
@@ -487,42 +530,151 @@ static int nau7802_read(const struct device *dev,
  * @return 0 if successful
  *  
  */
-static int nau7802_initial_config(const struct device *dev, Nau7802_chn_mode chn_mode)
+static int nau7802_initial_config(const struct device *dev, const struct adc_channel_cfg *channel_cfg)
 {
     const struct nau7802_config *config = dev->config;
     int ret = 0;
+	NAU7802_Gain_Values gain = NAU7802_GAIN_128;
+	int odr = 0;
 
 	// Canal
-	ret |= nau7802_setChannel(dev, config->channel);
-#ifdef ADC_NAU7802_LDO_OFF
-	ret |= nau7802_LDO_off(dev);
-#else
-	//Set LDO to 3.3V note: 2v4 not recommended (doesnt work)
-	ret |= nau7802_setLDO(dev, config->ldo_mode); 
-#endif
-#ifdef ADC_NNAU7802_I2C_PULL_S
-	ret |= nau7802_setBit(dev, NAU7802_PU_I2C_CTRL_SPE, NAU7802_I2C_CONTROL);
-#endif
-#ifdef ADC_NNAU7802_I2C_WEAK_PULLUP_OFF
-	// Turns off 50k pullup resistor
-	ret |= nau7802_setBit(dev, NAU7802_PU_I2C_CTRL_WPD, NAU7802_I2C_CONTROL);	
-#endif
+	ret |= nau7802_setChannel(dev, channel_cfg->channel_id);
+
+	if(channel_cfg->reference == ADC_REF_INTERNAL)
+	{
+		//Set LDO note: 2v4 not recommended (doesnt work)
+		ret |= nau7802_setLDO(dev, config->ldo); 
+	}else
+	{
+		ret |= nau7802_LDO_off(dev);
+	}
+
+	switch (channel_cfg->gain) {
+		case ADC_GAIN_1:	
+			gain = NAU7802_GAIN_1;					
+			break;
+		case ADC_GAIN_2:
+			gain = NAU7802_GAIN_2;					
+			break;
+		case ADC_GAIN_4:
+			gain = NAU7802_GAIN_4;					
+			break;
+		case ADC_GAIN_8:
+			gain = NAU7802_GAIN_8;					
+			break;
+		case ADC_GAIN_16:
+			gain = NAU7802_GAIN_16;					
+			break;
+		case ADC_GAIN_32:
+			gain = NAU7802_GAIN_32;					
+			break;
+		case ADC_GAIN_64:
+			gain = NAU7802_GAIN_64;					
+			break;
+		case ADC_GAIN_128:
+			gain = NAU7802_GAIN_128;					
+			break;
+		default:
+			LOG_ERR("unsupported channel gain '%d'", channel_cfg->gain);
+			return -ENOTSUP;
+	}
 	//Set gain
-	ret |= nau7802_setGain(dev, config->pga_gain);							
+	ret |= nau7802_setGain(dev, gain);	
+
 	//Set samples per second 
-	ret |= nau7802_setSampleRate(dev, config->sps_mode); 				
+	ret |= nau7802_time_to_sps(dev, channel_cfg->acquisition_time);
+
 	//Turn off CLK_CHP. From 9.1 power on sequencing.
-	ret |= nau7802_setRegister(dev, NAU7802_ADC, 0x30);							
-#ifdef ADC_NAU7802_SINGLE_CHN
+	ret |= nau7802_setRegister(dev, NAU7802_ADC, 0x30);	
+
+	ret |= nau7802_hidden_chn_config(dev);
+
+	return ret;
+}
+
+static inline int nau7802_time_to_sps(const struct device *dev, uint16_t acq_time)
+{
+	struct nau7802_data *data = dev->data;
+	const struct nau7802_config *ads_config = dev->config;
+	const uint32_t *odr_delay = ads_config->odr_delay;
+	uint32_t odr_delay_us = 0;
+	int odr = -EINVAL;
+	uint16_t acq_value = ADC_ACQ_TIME_VALUE(acq_time);
+	NAU7802_SPS_Values sps = NAU7802_SPS_40;
+
+	/* The nau7802 uses samples per seconds units with the lowest being 10SPS
+	 * and with acquisition_time only having 14b for time, this will not fit
+	 * within here for microsecond units. Use Tick units and allow the user to
+	 * specify the ODR directly.
+	 */
+	if (acq_time != ADC_ACQ_TIME_DEFAULT && ADC_ACQ_TIME_UNIT(acq_time) != ADC_ACQ_TIME_TICKS) {
+		return -EINVAL;
+	}
+
+	if (acq_time == ADC_ACQ_TIME_DEFAULT) {
+		odr = NAU7802_CONFIG_DR_DEFAULT;
+		odr_delay_us = odr_delay[NAU7802_CONFIG_DR_DEFAULT];
+		sps = (odr == NAU7802_CONFIG_DR_320) ? NAU7802_SPS_320 : odr;
+	} else {
+		switch (acq_value) {
+		case NAU7802_CONFIG_DR_10:
+			odr = NAU7802_CONFIG_DR_10;
+			sps = NAU7802_SPS_10;
+			odr_delay_us = odr_delay[NAU7802_CONFIG_DR_10];
+			break;
+		case NAU7802_CONFIG_DR_20:
+			odr = NAU7802_CONFIG_DR_20;
+			sps = NAU7802_SPS_20;
+			odr_delay_us = odr_delay[NAU7802_CONFIG_DR_20];
+			break;
+		case NAU7802_CONFIG_DR_40:
+			odr = NAU7802_CONFIG_DR_40;
+			sps = NAU7802_SPS_40;
+			odr_delay_us = odr_delay[NAU7802_CONFIG_DR_40];
+			break;
+		case NAU7802_CONFIG_DR_80:
+			odr = NAU7802_CONFIG_DR_80;
+			sps = NAU7802_SPS_80;
+			odr_delay_us = odr_delay[NAU7802_CONFIG_DR_80];
+			break;
+		case NAU7802_CONFIG_DR_320:
+			odr = NAU7802_CONFIG_DR_320;
+			sps = NAU7802_SPS_320;
+			odr_delay_us = odr_delay[NAU7802_CONFIG_DR_320];
+			break;
+		default:
+			break;
+		}
+	}
+
+	data->ready_time = K_USEC(odr_delay_us);
+
+	return nau7802_setSampleRate(dev, sps);
+}
+
+static inline int nau7802_hidden_chn_config(const struct device *dev)
+{
+	int ret = 0;
+#ifdef ADC_NAU7802_SINGLE_CHN // Hidden config to enable single channel mode
 	if(chn_mode == NAU7802_S_CHN_MODE)
 	{
 		//Enable 330pF decoupling cap on chan 2. From 9.14 application circuit note
 		ret |= nau7802_setBit(dev, NAU7802_PGA_PWR_PGA_CAP_EN, NAU7802_PGA_PWR);	
 	}
 #endif	
+#ifdef ADC_NAU7802_I2C_PULL_S	// Turns on 2k6 I2C pull-ups
+	ret |= nau7802_setBit(dev, NAU7802_PU_I2C_CTRL_SPE, NAU7802_I2C_CONTROL);
+#endif
+#ifdef ADC_NAU7802_I2C_WEAK_PULLUP_OFF	// Turns off 50k I2C pull-ups
+	// Turns off 50k pullup resistor
+	ret |= nau7802_setBit(dev, NAU7802_PU_I2C_CTRL_WPD, NAU7802_I2C_CONTROL);	
+#endif
 #ifdef ADC_NAU7802_LOW_POWER
 	ret |= low_accuracy_set(dev);
 #endif	
+
+	ARG_UNUSED(dev);
+	
 	return ret;
 }
 
@@ -1325,14 +1477,22 @@ void nau7802_temperature_disable(const struct device *dev)
 }
 #endif
 
+/*
+ * Approximated NAU7802 acquisition times in microseconds. These are
+ * used for the initial delay when polling for data ready.
+ * {10 SPS, 20 SPS, 40 SPS(default), 80 SPS, 320 SPS}
+ */
+#define NAU7802_ODR_DELAY_US                             \
+	{                                                    \
+		100000, 50000, 25000, 12500, 3125                \
+	}
+
 // Update device instantiation macro
 #define ADC_NAU7802_INST_DEFINE(n)                                              \
     static const struct nau7802_config config_##n = {                           \
-        .i2c = I2C_DT_SPEC_INST_GET(n),                                         \
-        .channel = DT_INST_PROP_OR(n, channel, 0),                                    \
-        .ldo_mode = DT_INST_PROP_OR(n, ldo_voltage, 0),                               \
-        .pga_gain = DT_INST_PROP_OR(n, gain, 0),                                      \
-        .sps_mode = DT_INST_PROP_OR(n, sps, 0),                                       \
+        .bus = I2C_DT_SPEC_INST_GET(n),                                         \
+        .ldo = DT_INST_PROP_OR(n, ldo_voltage, 0),                              \
+        .odr_delay = NAU7802_ODR_DELAY_US,                               		\
     };                                                                          \
     static struct nau7802_data data_##n;                                        \
     DEVICE_DT_INST_DEFINE(n, nau7802_init, NULL, &data_##n, &config_##n,        \
